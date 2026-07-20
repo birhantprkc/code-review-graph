@@ -18,6 +18,7 @@ To target a specific platform instead of auto-detecting all:
 code-review-graph install --platform codex
 code-review-graph install --platform cursor
 code-review-graph install --platform claude-code
+code-review-graph install --platform codebuddy
 ```
 
 ### Supported Platforms
@@ -26,11 +27,12 @@ code-review-graph install --platform claude-code
 |----------|-------------|
 | **Codex** | `~/.codex/config.toml` + `~/.codex/hooks.json` |
 | **Claude Code** | `.mcp.json` + `.claude/settings.json` |
+| **CodeBuddy Code** | `.mcp.json` + `CODEBUDDY.md` + `.codebuddy/settings.json` + `.codebuddy/skills/<name>/SKILL.md` |
 | **Cursor** | `.cursor/mcp.json` |
 | **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
 | **Zed** | `.zed/settings.json` |
 | **Continue** | `.continue/config.json` |
-| **OpenCode** | `.opencode.json` |
+| **OpenCode** | `opencode.jsonc` (preferred) or `opencode.json` |
 | **Antigravity** | `~/.gemini/antigravity/mcp_config.json` |
 | **Gemini CLI** | `.gemini/settings.json` |
 | **Qwen Code** | `~/.qwen/settings.json` |
@@ -38,6 +40,13 @@ code-review-graph install --platform claude-code
 | **Qoder** | `.qoder/mcp.json` |
 | **GitHub Copilot** | `.vscode/mcp.json` |
 | **GitHub Copilot CLI** | `~/.copilot/mcp-config.json` |
+
+The CodeBuddy project layout follows its official documentation for
+[MCP configuration](https://www.codebuddy.ai/docs/cli/mcp),
+[skills](https://www.codebuddy.ai/docs/cli/skills), and
+[hooks](https://www.codebuddy.ai/docs/cli/hooks). The shared `.mcp.json` is
+merged with JSONC awareness, while hook commands resolve the repository at
+runtime so committed settings do not contain one developer's checkout path.
 
 ## Core Workflow
 
@@ -80,6 +89,22 @@ Then use `embed_graph_tool` to compute vectors. `semantic_search_nodes_tool` aut
 
 Embedding providers are local sentence-transformers, OpenAI-compatible endpoints, Google Gemini, and MiniMax. Local embeddings use `CRG_EMBEDDING_MODEL`; OpenAI-compatible providers use `CRG_OPENAI_BASE_URL`, `CRG_OPENAI_API_KEY`, and `CRG_OPENAI_MODEL`. Cloud providers are opt-in and print an egress warning unless `CRG_ACCEPT_CLOUD_EMBEDDINGS=1` is set.
 
+Function/class documentation summaries are included in embedding text. For a
+graph created by an older release, run a full build once before re-embedding so
+all files gain that metadata. Embedding refresh after build/update/watch is
+always default-off; opt in with an exact provider and model, for example:
+
+```bash
+code-review-graph build \
+  --embedding-provider local \
+  --embedding-model all-MiniLM-L6-v2
+```
+
+The same two options work with `update`, `postprocess`, and `watch`. They must be
+provided together. A refresh only updates a previously embedded graph, refuses
+to migrate vectors to a different provider/model/endpoint, purges deleted-node
+vectors, and degrades provider or transport failures to graph-build warnings.
+
 ### 7. Detect changes with risk scoring (v2)
 ```
 Ask your MCP client: "Review my recent changes with risk scoring"
@@ -116,7 +141,7 @@ Since v2.3.4, review and impact tools include compact `context_savings` metadata
 
 ## Supported Languages
 
-The parser currently covers Python, JavaScript, TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte single-file components, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks (`.ipynb`), and Perl XS files (`.xs`).
+The parser currently covers Python, JavaScript, TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte single-file components, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks (`.ipynb`), and Perl XS files (`.xs`).
 
 Extension-less scripts are detected by shebang for common bash/sh/zsh/ksh/dash/ash, Python, Node, Ruby, Perl, Lua, Rscript, and PHP interpreters.
 

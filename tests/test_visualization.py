@@ -1,11 +1,52 @@
 """Tests for graph visualization export."""
 
 import json
+import shutil
+import subprocess
+from html.parser import HTMLParser
 
 import pytest
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import EdgeInfo, NodeInfo
+
+
+class _ScriptExtractor(HTMLParser):
+    """Collect external script URLs and inline script bodies from HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.sources: list[str] = []
+        self.inline_scripts: list[str] = []
+        self._inline_chunks: list[str] | None = None
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag != "script":
+            return
+        source = dict(attrs).get("src")
+        if source is not None:
+            self.sources.append(source)
+            self._inline_chunks = None
+        else:
+            self._inline_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._inline_chunks is not None:
+            self._inline_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._inline_chunks is not None:
+            self.inline_scripts.append("".join(self._inline_chunks))
+            self._inline_chunks = None
+
+
+def _extract_scripts(content: str) -> tuple[list[str], list[str]]:
+    parser = _ScriptExtractor()
+    parser.feed(content)
+    parser.close()
+    return parser.sources, parser.inline_scripts
 
 
 @pytest.fixture
@@ -128,6 +169,45 @@ def test_export_graph_data(store_with_data):
     json.dumps(data)  # must be serializable
 
 
+def test_export_json_writes_utf8_graph_data(store_with_data, tmp_path):
+    from code_review_graph.exports import export_json
+
+    output_path = tmp_path / "nested" / "graph.json"
+    result = export_json(store_with_data, output_path)
+
+    assert result == output_path
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert {node["name"] for node in payload["nodes"]} >= {
+        "auth.py",
+        "AuthService",
+        "login",
+    }
+    assert {edge["kind"] for edge in payload["edges"]} == {
+        "CALLS",
+        "CONTAINS",
+    }
+
+
+def test_export_json_failure_preserves_existing_file(
+    store_with_data, tmp_path, monkeypatch
+):
+    from code_review_graph import exports
+
+    output_path = tmp_path / "graph.json"
+    output_path.write_text("existing export\n", encoding="utf-8")
+    monkeypatch.setattr(
+        exports,
+        "export_graph_data",
+        lambda _store: {"not_json": {object()}},
+    )
+
+    with pytest.raises(TypeError):
+        exports.export_json(store_with_data, output_path)
+
+    assert output_path.read_text(encoding="utf-8") == "existing export\n"
+    assert list(tmp_path.glob(".graph.json.*.tmp")) == []
+
+
 def test_generate_html(store_with_data, tmp_path):
     from code_review_graph.visualization import generate_html
 
@@ -135,11 +215,24 @@ def test_generate_html(store_with_data, tmp_path):
     generate_html(store_with_data, output_path)
     assert output_path.exists()
     content = output_path.read_text()
-    assert "d3js.org" in content or "d3.v7" in content
+    script_sources, _inline_scripts = _extract_scripts(content)
+    assert script_sources == ["https://d3js.org/d3.v7.min.js"]
     assert "auth.py" in content
     assert "AuthService" in content
     assert "<!DOCTYPE html>" in content
     assert "</html>" in content
+
+
+def test_script_extraction_handles_case_insensitive_html_tags():
+    content = (
+        '<SCRIPT SRC="https://d3js.org/d3.v7.min.js"></SCRIPT>'
+        "<SCRIPT>const responsive = 1 < 2;</SCRIPT>"
+    )
+
+    script_sources, inline_scripts = _extract_scripts(content)
+
+    assert script_sources == ["https://d3js.org/d3.v7.min.js"]
+    assert inline_scripts == ["const responsive = 1 < 2;"]
 
 
 def test_cpp_include_resolution(tmp_path):
@@ -305,6 +398,89 @@ def test_generate_html_includes_loading_and_empty_state(store_with_data, tmp_pat
     assert "loading-overlay" in content
     assert "empty-state" in content
     assert "No nodes to display" in content
+
+
+def test_generate_html_uses_id_selector_for_svg(store_with_data, tmp_path):
+    """Regression test for #523: d3.select("svg") selects the legend icon, not the canvas.
+
+    The legend <nav> contains inline <svg> icons that appear before #graph-svg
+    in document order. d3.select("svg") returns the first match — a 16px legend
+    icon — causing the entire force graph to render inside it. The fix targets
+    #graph-svg by id.
+    """
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "graph.html"
+    generate_html(store_with_data, output_path)
+    content = output_path.read_text()
+    assert 'd3.select("#graph-svg")' in content, (
+        "HTML should use d3.select('#graph-svg') to target the main canvas, "
+        "not d3.select('svg') which selects the first inline legend icon"
+    )
+    assert 'd3.select("svg")' not in content, (
+        "No bare d3.select('svg') should remain — it selects legend icons"
+    )
+
+
+def test_community_mode_uses_id_selector_for_svg(large_store, tmp_path):
+    """Regression test for #523: community/aggregated template must also use #graph-svg."""
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "community.html"
+    generate_html(large_store, output_path, mode="community")
+    content = output_path.read_text()
+    assert 'd3.select("#graph-svg")' in content
+    assert 'd3.select("svg")' not in content
+    assert 'id="graph-svg"' in content, (
+        "Aggregated template's <svg> must have id='graph-svg' for the selector to work"
+    )
+
+
+def _assert_responsive_graph_script(content):
+    """Check the generated graph script remains responsive and valid JavaScript."""
+    assert 'var svgEl = document.getElementById("graph-svg");' in content
+    assert "function getW()" in content
+    assert "function getH()" in content
+    assert "function fitGraph(retries)" in content
+    assert "if (retries === undefined) retries = 10;" in content
+    assert "requestAnimationFrame(function() { fitGraph(retries - 1); });" in content
+    assert 'window.addEventListener("resize", function() {' in content
+    assert r'window.addEventListener(\"resize\"' not in content
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for generated JavaScript syntax validation")
+    _script_sources, inline_scripts = _extract_scripts(content)
+    assert inline_scripts
+    for script in inline_scripts:
+        if not script.strip():
+            continue
+        result = subprocess.run(
+            [node, "--check"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+def test_full_mode_retries_layout_and_tracks_viewport(store_with_data, tmp_path):
+    """Full mode must recover if layout is unavailable before the first paint."""
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "graph.html"
+    generate_html(store_with_data, output_path, mode="full")
+    _assert_responsive_graph_script(output_path.read_text())
+
+
+def test_community_mode_retries_layout_and_tracks_viewport(large_store, tmp_path):
+    """Aggregated mode must use the same bounded layout recovery path."""
+    from code_review_graph.visualization import generate_html
+
+    output_path = tmp_path / "community.html"
+    generate_html(large_store, output_path, mode="community")
+    _assert_responsive_graph_script(output_path.read_text())
 
 
 def test_generate_html_includes_focus_visible(store_with_data, tmp_path):

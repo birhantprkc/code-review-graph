@@ -389,6 +389,253 @@ class TestCSharpParsing:
         names = {f.name for f in funcs}
         assert "FindById" in names or "Save" in names
 
+    def test_finds_inheritance(self):
+        inherits = [e for e in self.edges if e.kind == "INHERITS"]
+        targets = {e.target for e in inherits}
+        assert "IRepository" in targets
+        assert "InMemoryRepo" in targets
+        assert "System.IDisposable" in targets
+        assert "List<User>" in targets
+        assert all(not e.target.startswith(":") for e in inherits)
+        assert all("," not in e.target for e in inherits)
+
+    def test_inheritance_hard_cases(self):
+        inherits = [e for e in self.edges if e.kind == "INHERITS"]
+        by_source = {}
+        for edge in inherits:
+            by_source.setdefault(edge.source.rsplit("::", 1)[-1], set()).add(
+                edge.target
+            )
+
+        assert by_source.get("AuditedUser") == {"User", "IRepository"}
+        assert by_source.get("TaggedUser") == {"User"}
+        assert "IRepository" in by_source.get("Token", set())
+        assert "System.Collections.Generic.List<User>" in {
+            edge.target for edge in inherits
+        }
+        assert "ConstrainedHolder" not in by_source
+        assert by_source.get("SeededRepo") == {"InMemoryRepo"}
+        assert all(not edge.target.startswith("(") for edge in inherits)
+        assert "Status" not in by_source
+        assert "byte" not in {edge.target for edge in inherits}
+
+    @pytest.mark.parametrize(
+        ("statement", "expected_targets"),
+        [
+            ("Ping();", {"Ping"}),
+            ("service.Send();", {"Send"}),
+            ("service.GetClient().Fetch();", {"GetClient", "Fetch"}),
+            ("service?.Notify();", {"Notify"}),
+        ],
+        ids=("bare", "member", "chained", "null-conditional"),
+    )
+    def test_finds_calls_and_attributes_them_to_enclosing_method(
+        self, tmp_path, statement, expected_targets,
+    ):
+        source_file = tmp_path / "Calls.cs"
+        source_file.write_text(
+            "class Caller\n"
+            "{\n"
+            "    void Run()\n"
+            "    {\n"
+            f"        {statement}\n"
+            "    }\n"
+            "}\n"
+        )
+
+        _, edges = self.parser.parse_file(source_file)
+        calls = [edge for edge in edges if edge.kind == "CALLS"]
+        call_targets = {
+            edge.target.split("::")[-1].split(".")[-1]: edge
+            for edge in calls
+        }
+
+        assert expected_targets <= call_targets.keys()
+        assert all(
+            call_targets[target].source.endswith("::Caller.Run")
+            for target in expected_targets
+        )
+
+
+@pytest.mark.skipif(
+    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+)
+class TestCSharpAttributes:
+    """Regression tests for #295 (C# half): C# attributes use
+    ``attribute_list`` nodes, not ``modifiers > annotation``, so they need
+    a dedicated capture path. Persisted in ``modifiers`` + ``extra['decorators']``.
+    """
+
+    def _parse(self, source: str, tmp_path):
+        p = tmp_path / "x.cs"
+        p.write_text(source, encoding="utf-8")
+        return CodeParser().parse_file(p)
+
+    def test_method_attributes_captured(self, tmp_path):
+        nodes, _ = self._parse(
+            "namespace Api;\npublic class Ctrl {\n"
+            "    [HttpGet(\"/x\")]\n    [Authorize]\n"
+            "    public void Get() {}\n}\n",
+            tmp_path,
+        )
+        get = next(n for n in nodes if n.kind == "Function" and n.name == "Get")
+        assert get.extra.get("decorators") == ["HttpGet", "Authorize"]
+        assert get.modifiers == "HttpGet,Authorize"
+
+    def test_class_attribute_captured(self, tmp_path):
+        nodes, _ = self._parse(
+            "namespace Api;\n[ApiController]\npublic class Ctrl {\n"
+            "    public void Get() {}\n}\n",
+            tmp_path,
+        )
+        ctrl = next(n for n in nodes if n.kind == "Class" and n.name == "Ctrl")
+        assert ctrl.extra.get("decorators") == ["ApiController"]
+        assert ctrl.modifiers == "ApiController"
+
+    def test_unattributed_method_has_none_modifiers(self, tmp_path):
+        nodes, _ = self._parse(
+            "namespace Api;\npublic class C {\n    public void Plain() {}\n}\n",
+            tmp_path,
+        )
+        plain = next(n for n in nodes if n.kind == "Function" and n.name == "Plain")
+        assert plain.modifiers is None
+        assert "decorators" not in plain.extra
+
+
+@pytest.mark.skipif(
+    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+)
+class TestCSharpNamespaceResolution:
+    """Regression tests for #310: C# ``using X.Y;`` directives carry a
+    namespace string as their ``IMPORTS_FROM.target`` (not a file path), so
+    ``importers_of`` returned [] for every .cs file. The fix tags File
+    nodes with their declared namespaces and adds a namespace fallback.
+    """
+
+    def _write(self, path: Path, source: str) -> None:
+        path.write_text(source, encoding="utf-8")
+
+    def test_file_scoped_namespace_tagged(self, tmp_path):
+        f = tmp_path / "Core.cs"
+        self._write(f, "namespace ACME.Core;\npublic class TaskBoard {}\n")
+        nodes, _ = CodeParser().parse_file(f)
+        file_node = next(n for n in nodes if n.kind == "File")
+        assert file_node.extra.get("csharp_namespaces") == ["ACME.Core"]
+
+    def test_block_namespace_tagged(self, tmp_path):
+        f = tmp_path / "Core.cs"
+        self._write(f, "namespace ACME.Core {\n    public class T {}\n}\n")
+        nodes, _ = CodeParser().parse_file(f)
+        file_node = next(n for n in nodes if n.kind == "File")
+        assert file_node.extra.get("csharp_namespaces") == ["ACME.Core"]
+
+    def test_non_csharp_file_has_no_namespace_tag(self, tmp_path):
+        f = tmp_path / "mod.py"
+        self._write(f, "def foo():\n    pass\n")
+        nodes, _ = CodeParser().parse_file(f)
+        file_node = next(n for n in nodes if n.kind == "File")
+        assert "csharp_namespaces" not in file_node.extra
+
+    def test_importers_of_resolves_namespace_to_file(self, tmp_path):
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.tools.query import query_graph
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".code-review-graph").mkdir()
+        core = tmp_path / "Core.cs"
+        self._write(core, "namespace ACME.Core;\npublic class TaskBoard {}\n")
+        app = tmp_path / "App.cs"
+        self._write(app, "using ACME.Core;\nnamespace ACME.App;\npublic class App {}\n")
+        unrelated = tmp_path / "Unrelated.cs"
+        self._write(
+            unrelated,
+            "using System.Linq;\nnamespace ACME.Other;\npublic class Other {}\n",
+        )
+
+        store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
+        parser = CodeParser()
+        for path in (core, app, unrelated):
+            nodes, edges = parser.parse_file(path)
+            for n in nodes:
+                store.upsert_node(n)
+            for e in edges:
+                store.upsert_edge(e)
+        store.commit()
+        store.close()
+
+        result = query_graph("importers_of", str(core), repo_root=str(tmp_path))
+        assert result.get("status") == "ok"
+        importers = {r["file"] for r in result.get("results", [])}
+        assert str(app) in importers
+        assert str(unrelated) not in importers
+
+    def test_importers_of_resolves_nested_block_namespace(self, tmp_path):
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.tools.query import query_graph
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".code-review-graph").mkdir()
+        core = tmp_path / "Core.cs"
+        self._write(
+            core,
+            "namespace Acme {\n"
+            "    namespace Core {\n"
+            "        public class TaskBoard {}\n"
+            "    }\n"
+            "}\n",
+        )
+        app = tmp_path / "App.cs"
+        self._write(
+            app,
+            "using Acme.Core;\n"
+            "namespace Acme.App;\n"
+            "public class App {}\n",
+        )
+
+        store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
+        parser = CodeParser()
+        for path in (core, app):
+            nodes, edges = parser.parse_file(path)
+            for node in nodes:
+                store.upsert_node(node)
+            for edge in edges:
+                store.upsert_edge(edge)
+        store.commit()
+        store.close()
+
+        result = query_graph("importers_of", str(core), repo_root=str(tmp_path))
+        assert result.get("status") == "ok"
+        importers = {r["file"] for r in result.get("results", [])}
+        assert str(app) in importers
+
+    def test_deep_ast_preserves_nested_namespace_metadata(self, tmp_path):
+        """Namespace discovery must not recurse through the whole C# AST."""
+        source_file = tmp_path / "Deep.cs"
+        deep_expression = "(" * 1200 + "1" + ")" * 1200
+        self._write(
+            source_file,
+            "namespace Acme {\n"
+            "    namespace Core {\n"
+            "        public class Calculator {\n"
+            "            public int Value() {\n"
+            f"                return {deep_expression};\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "}\n",
+        )
+
+        try:
+            nodes, _ = CodeParser().parse_file(source_file)
+        except RecursionError:
+            pytest.fail("C# namespace discovery overflowed on a deep expression AST")
+
+        file_node = next(node for node in nodes if node.kind == "File")
+        assert file_node.extra.get("csharp_namespaces") == [
+            "Acme",
+            "Acme.Core",
+        ]
+
 
 class TestRubyParsing:
     def setup_method(self):
@@ -446,13 +693,138 @@ class TestPHPParsing:
         assert "search" in target_names
 
         # Scoped/static calls
-        assert "QueryUtils::fetchRecords" in targets
-        assert "EncounterService::create" in targets
+        assert any(
+            target.endswith("sample.php::QueryUtils.fetchRecords")
+            for target in targets
+        )
+        assert any(
+            target.endswith("sample.php::EncounterService.create")
+            for target in targets
+        )
         assert any(t.endswith("__construct") for t in run_queries_targets)
         assert any(t.endswith("factory") for t in run_queries_targets)
 
         # Global namespaced calls should normalize to a stable name
         assert "dirname" in target_names
+
+    def test_finds_extended_php_types_bases_and_object_creation(self):
+        source = b"""<?php
+trait Auditable {}
+enum Status: string { case Active = 'active'; }
+interface Contract {}
+
+class Service extends \\Framework\\Base implements Contract, \\Other\\Marker {
+    public function run(): void {
+        $worker = new \\App\\Worker();
+        $worker->save();
+        Service::factory();
+    }
+}
+"""
+
+        nodes, edges = self.parser.parse_bytes(Path("extended.php"), source)
+
+        class_names = {node.name for node in nodes if node.kind == "Class"}
+        assert {"Auditable", "Status", "Contract", "Service"} <= class_names
+
+        inherited = {edge.target for edge in edges if edge.kind == "INHERITS"}
+        assert "\\Framework\\Base" in inherited
+        assert "Contract" in inherited
+        assert "\\Other\\Marker" in inherited
+
+        calls = {edge.target for edge in edges if edge.kind == "CALLS"}
+        assert "App\\Worker" in calls
+        # Existing PHP call formatting must stay unchanged.
+        assert "save" in calls
+        assert "Service::factory" in calls
+
+
+class TestPHPImportResolution:
+    """PHP ``use`` imports resolve to absolute file paths (PSR-4 layout)."""
+
+    def test_resolves_project_import(self, tmp_path):
+        """``use`` of a project class resolves to its .php file."""
+        entity = tmp_path / "src/App/Domain/Entity"
+        entity.mkdir(parents=True)
+        (entity / "Job.php").write_text(
+            "<?php\nnamespace App\\Domain\\Entity;\nclass Job {}\n"
+        )
+        svc = tmp_path / "src/App/Service"
+        svc.mkdir(parents=True)
+        (svc / "MatchService.php").write_text(
+            "<?php\nnamespace App\\Service;\n"
+            "use App\\Domain\\Entity\\Job;\n"
+            "class MatchService {}\n"
+        )
+
+        parser = CodeParser(tmp_path)
+        _, edges = parser.parse_file(svc / "MatchService.php")
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        assert len(imports) == 1
+        assert imports[0].target == str((entity / "Job.php").resolve())
+
+    def test_vendor_import_stays_unresolved(self, tmp_path):
+        """A class with no local file stays as the bare FQN, not a raw
+        ``use ...;`` statement and not a fake path."""
+        svc = tmp_path / "src/App/Service"
+        svc.mkdir(parents=True)
+        (svc / "Logger.php").write_text(
+            "<?php\nnamespace App\\Service;\n"
+            "use Psr\\Log\\LoggerInterface;\n"
+            "class Logger {}\n"
+        )
+        parser = CodeParser()
+        _, edges = parser.parse_file(svc / "Logger.php")
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        assert len(imports) == 1
+        assert imports[0].target == "Psr\\Log\\LoggerInterface"
+        assert not imports[0].target.endswith(".php")
+
+    def test_aliased_import_records_fqn_not_alias(self, tmp_path):
+        """``use A\\B\\C as D`` records the FQN A\\B\\C, ignoring the alias."""
+        contact = tmp_path / "src/App/Domain/Embedded"
+        contact.mkdir(parents=True)
+        (contact / "Contact.php").write_text(
+            "<?php\nnamespace App\\Domain\\Embedded;\nclass Contact {}\n"
+        )
+        job = tmp_path / "src/App/Domain/Entity"
+        job.mkdir(parents=True)
+        (job / "Job.php").write_text(
+            "<?php\nnamespace App\\Domain\\Entity;\n"
+            "use App\\Domain\\Embedded\\Contact as ContactEmbedded;\n"
+            "class Job {}\n"
+        )
+        parser = CodeParser(tmp_path)
+        _, edges = parser.parse_file(job / "Job.php")
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        assert len(imports) == 1
+        assert imports[0].target == str((contact / "Contact.php").resolve())
+
+    def test_grouped_use_expands_to_multiple_imports(self, tmp_path):
+        """``use App\\Domain\\{Entity\\Job, Model\\Status}`` -> two imports,
+        each prefixed with the group namespace and resolved independently."""
+        base = tmp_path / "src/App/Domain"
+        (base / "Entity").mkdir(parents=True)
+        (base / "Model").mkdir(parents=True)
+        (base / "Entity/Job.php").write_text(
+            "<?php\nnamespace App\\Domain\\Entity;\nclass Job {}\n"
+        )
+        (base / "Model/Status.php").write_text(
+            "<?php\nnamespace App\\Domain\\Model;\nclass Status {}\n"
+        )
+        consumer = tmp_path / "src/App/Service"
+        consumer.mkdir(parents=True)
+        (consumer / "C.php").write_text(
+            "<?php\nnamespace App\\Service;\n"
+            "use App\\Domain\\{Entity\\Job, Model\\Status};\n"
+            "class C {}\n"
+        )
+        parser = CodeParser(tmp_path)
+        _, edges = parser.parse_file(consumer / "C.php")
+        targets = {e.target for e in edges if e.kind == "IMPORTS_FROM"}
+        assert str((base / "Entity/Job.php").resolve()) in targets
+        assert str((base / "Model/Status.php").resolve()) in targets
+        assert len(targets) == 2
 
 
 class TestKotlinParsing:
@@ -480,6 +852,58 @@ class TestKotlinParsing:
         assert "println" in targets
         # Method call: repo.save(user)
         assert any("save" in t for t in targets)
+
+
+class TestKotlinAnnotations:
+    """Regression tests for #295: Kotlin nodes must persist annotation
+    metadata in both ``modifiers`` (comma-joined string) and
+    ``extra['decorators']`` (list) so consumers can filter queries like
+    "show me all @Composable functions" or "find @HiltViewModel classes".
+    """
+
+    def _parse(self, source: str, tmp_path):
+        p = tmp_path / "x.kt"
+        p.write_text(source, encoding="utf-8")
+        return CodeParser().parse_file(p)
+
+    def test_hilt_viewmodel_annotation_on_class(self, tmp_path):
+        nodes, _ = self._parse(
+            "package com.example\n@HiltViewModel\nclass MyVM {\n    fun noop() {}\n}\n",
+            tmp_path,
+        )
+        vm = next(n for n in nodes if n.kind == "Class" and n.name == "MyVM")
+        assert vm.modifiers == "HiltViewModel"
+        assert vm.extra.get("decorators") == ["HiltViewModel"]
+
+    def test_composable_annotation_on_function(self, tmp_path):
+        nodes, _ = self._parse(
+            "package com.example\n@Composable\nfun Greeting(n: String) {\n"
+            "    println(n)\n}\n",
+            tmp_path,
+        )
+        fn = next(n for n in nodes if n.kind == "Function" and n.name == "Greeting")
+        assert fn.modifiers == "Composable"
+        assert fn.extra.get("decorators") == ["Composable"]
+
+    def test_unannotated_function_has_none_modifiers(self, tmp_path):
+        """Guard: adding annotation support must not leak an empty string
+        or empty list onto unannotated nodes."""
+        nodes, _ = self._parse(
+            "package com.example\nfun bare() { println(1) }\n", tmp_path,
+        )
+        fn = next(n for n in nodes if n.kind == "Function" and n.name == "bare")
+        assert fn.modifiers is None
+        assert "decorators" not in fn.extra
+
+    def test_test_annotation_still_triggers_test_kind(self, tmp_path):
+        """Guard: annotation persistence must not break the pre-existing
+        @Test -> Test-kind promotion."""
+        nodes, _ = self._parse(
+            "package com.example\nclass T {\n    @Test\n    fun testX() { println(1) }\n}\n",
+            tmp_path,
+        )
+        t = next(n for n in nodes if n.kind == "Test" and n.name == "testX")
+        assert t.extra.get("decorators") == ["Test"]
 
 
 class TestSwiftParsing:
@@ -1961,7 +2385,6 @@ class TestRescriptCrossModuleResolver:
         assert second["calls_resolved"] == 0
         assert second["imports_resolved"] == 0
 
-
 class TestNixParsing:
     """Flake-aware Nix parser — see the Nix language-support epic."""
 
@@ -2548,3 +2971,699 @@ class TestSQLParsing:
         targets = {e.target for e in imports}
         # active_orders view and archive procedure both reference orders/users
         assert "orders" in targets or "users" in targets
+class TestZigParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.fixture = FIXTURES / "sample_zig.zig"
+        self.nodes, self.edges = self.parser.parse_file(self.fixture)
+
+    def test_detects_language(self):
+        assert self.parser.detect_language(Path("main.zig")) == "zig"
+
+    def test_finds_top_level_functions(self):
+        funcs = {
+            n.name for n in self.nodes
+            if n.kind == "Function" and n.parent_name is None
+        }
+        assert {"main", "helper"} <= funcs
+
+    def test_finds_struct_methods(self):
+        methods = {
+            n.name for n in self.nodes
+            if n.kind == "Function" and n.parent_name == "Point"
+        }
+        assert {"init", "distance"} <= methods
+
+    def test_finds_struct_enum_union_classes(self):
+        classes = {
+            n.name: n.extra.get("zig_kind") for n in self.nodes
+            if n.kind == "Class"
+        }
+        assert classes.get("Point") == "struct"
+        assert classes.get("Color") == "enum"
+        assert classes.get("Shape") == "union"
+
+    def test_finds_imports(self):
+        imports = [e for e in self.edges if e.kind == "IMPORTS_FROM"]
+        targets = {e.target for e in imports}
+        # std stays unresolved (no relative .zig path); util resolves to
+        # the absolute fixture path.
+        assert "std" in targets
+        assert any(
+            t.endswith("sample_zig_util.zig") and t != "./sample_zig_util.zig"
+            for t in targets
+        )
+
+    def test_finds_calls(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        # Bare callees (std.debug.print, expect, util.noop) keep their final
+        # identifier as the target; same-file helper resolves to the
+        # qualified name via _resolve_call_targets.
+        bare_targets = {e.target.split("::")[-1] for e in calls}
+        assert "print" in bare_targets
+        assert "expect" in bare_targets
+        assert "helper" in bare_targets
+
+    def test_builtin_calls_emitted(self):
+        # @intCast inside Point.distance should produce a CALLS edge
+        # whose target is the builtin name (with the leading @).
+        targets = {e.target for e in self.edges if e.kind == "CALLS"}
+        assert "@intCast" in targets
+
+    def test_at_import_is_not_a_call(self):
+        # @import is modelled as IMPORTS_FROM only — never as CALLS, so
+        # it doesn't pollute the call graph.
+        targets = {e.target for e in self.edges if e.kind == "CALLS"}
+        assert "@import" not in targets
+
+    def test_test_block_creates_test_node(self):
+        tests = [n for n in self.nodes if n.kind == "Test"]
+        assert len(tests) == 1
+        assert tests[0].name.startswith("test:helper increments@L")
+        assert tests[0].is_test is True
+
+    def test_in_source_test_emits_tested_by_outside_test_path(self):
+        path = Path("src/math.zig")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"fn increment(x: i32) i32 { return x + 1; }\n"
+            b'test "increment" { try expect(increment(1) == 2); }\n',
+        )
+
+        file_node = next(n for n in nodes if n.kind == "File")
+        test_node = next(n for n in nodes if n.kind == "Test")
+        function_node = next(
+            n for n in nodes if n.kind == "Function" and n.name == "increment"
+        )
+        test_qname = self.parser._qualify(
+            test_node.name, test_node.file_path, test_node.parent_name,
+        )
+        function_qname = self.parser._qualify(
+            function_node.name, function_node.file_path, function_node.parent_name,
+        )
+
+        assert file_node.is_test is False
+        assert any(
+            edge.kind == "CALLS"
+            and edge.source == test_qname
+            and edge.target == function_qname
+            for edge in edges
+        )
+        assert any(
+            edge.kind == "TESTED_BY"
+            and edge.source == function_qname
+            and edge.target == test_qname
+            for edge in edges
+        )
+
+    def test_calls_inside_methods_have_qualified_source(self):
+        # Point.distance calls helper(...) — the source should be the
+        # qualified Point.distance name, not the bare file path.
+        sources = {
+            e.source.split("::")[-1] for e in self.edges
+            if e.kind == "CALLS"
+        }
+        assert "Point.distance" in sources
+
+    def test_nodes_have_zig_language(self):
+        for node in self.nodes:
+            assert node.language == "zig"
+
+class TestHCLParsing:
+    """HCL / Terraform parser — closes #199."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "sample.tf")
+
+    def test_detects_language(self):
+        assert self.parser.detect_language(Path("main.tf")) == "hcl"
+        assert self.parser.detect_language(Path("config.hcl")) == "hcl"
+
+    def test_nodes_have_hcl_language(self):
+        for n in self.nodes:
+            assert n.language == "hcl"
+
+    def test_file_node(self):
+        file_nodes = [n for n in self.nodes if n.kind == "File"]
+        assert len(file_nodes) == 1
+        assert file_nodes[0].name.endswith("sample.tf")
+
+    def test_finds_resources(self):
+        classes = {n.name for n in self.nodes if n.kind == "Class"}
+        assert "resource.aws_vpc.main" in classes
+        assert "resource.aws_instance.web" in classes
+        assert "resource.aws_subnet.main" in classes
+
+    def test_finds_data_sources(self):
+        classes = {n.name for n in self.nodes if n.kind == "Class"}
+        assert "data.aws_ami.ubuntu" in classes
+
+    def test_finds_modules(self):
+        classes = {n.name for n in self.nodes if n.kind == "Class"}
+        assert "module.security" in classes
+
+    def test_finds_variables(self):
+        funcs = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "var.region" in funcs
+        assert "var.instance_type" in funcs
+
+    def test_finds_outputs(self):
+        funcs = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "output.instance_ip" in funcs
+        assert "output.vpc_id" in funcs
+
+    def test_finds_locals(self):
+        funcs = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "local.name_prefix" in funcs
+        assert "local.full_name" in funcs
+
+    def test_finds_provider(self):
+        funcs = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "provider.aws" in funcs
+
+    def test_hcl_type_extra_metadata(self):
+        by_name = {n.name: n for n in self.nodes if n.kind != "File"}
+        assert by_name["resource.aws_vpc.main"].extra["hcl_type"] == "resource"
+        assert by_name["data.aws_ami.ubuntu"].extra["hcl_type"] == "data"
+        assert by_name["module.security"].extra["hcl_type"] == "module"
+        assert by_name["var.region"].extra["hcl_type"] == "variable"
+        assert by_name["output.instance_ip"].extra["hcl_type"] == "output"
+        assert by_name["local.name_prefix"].extra["hcl_type"] == "local"
+        assert by_name["provider.aws"].extra["hcl_type"] == "provider"
+
+    def test_module_source_creates_import_edge(self):
+        imports = [e for e in self.edges if e.kind == "IMPORTS_FROM"]
+        targets = [e.target for e in imports]
+        assert any("modules/security" in t for t in targets)
+
+    def test_contains_edges(self):
+        contains = [e for e in self.edges if e.kind == "CONTAINS"]
+        targets = {e.target for e in contains}
+        # All non-File nodes should be contained by the file
+        for n in self.nodes:
+            if n.kind != "File":
+                qn = f"{n.file_path}::{n.name}"
+                assert qn in targets, f"missing CONTAINS for {n.name}"
+
+    def test_resource_references_variable(self):
+        """resource.aws_instance.web references var.instance_type."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_instance.web" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.instance_type" in t for t in targets)
+
+    def test_resource_references_other_resource(self):
+        """resource.aws_instance.web references resource.aws_subnet.main."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_instance.web" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_subnet.main" in t for t in targets)
+
+    def test_resource_references_data_source(self):
+        """resource.aws_instance.web references data.aws_ami.ubuntu."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_instance.web" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("data.aws_ami.ubuntu" in t for t in targets)
+
+    def test_output_references_resource(self):
+        """output.instance_ip references resource.aws_instance.web."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "output.instance_ip" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_instance.web" in t for t in targets)
+
+    def test_module_references_resource(self):
+        """module.security references resource.aws_vpc.main."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "module.security" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_vpc.main" in t for t in targets)
+
+    def test_provider_references_variable(self):
+        """provider.aws references var.region."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "provider.aws" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.region" in t for t in targets)
+
+    def test_terraform_block_skipped(self):
+        """terraform {} block should not produce any nodes."""
+        names = {n.name for n in self.nodes if n.kind != "File"}
+        assert not any(name.startswith("terraform") for name in names)
+
+    def test_resource_references_local(self):
+        """resource.aws_vpc.main references local.full_name."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_vpc.main" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("local.full_name" in t for t in targets)
+
+    # ------------------------------------------------------------------
+    # Variable references inside function call arguments
+    # ------------------------------------------------------------------
+
+    def test_count_with_function_extracts_var_ref(self):
+        """length(var.subnet_ids) in count — var.subnet_ids must be extracted."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_instance.fleet" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.subnet_ids" in t for t in targets), (
+            f"Expected var.subnet_ids in refs from fleet; got {targets}"
+        )
+
+    # ------------------------------------------------------------------
+    # Block-local meta-argument iterators must not produce REFERENCES edges
+    # ------------------------------------------------------------------
+
+    def test_each_value_produces_no_spurious_edge(self):
+        """each.value.id should not produce any REFERENCES edge."""
+        each_edges = [
+            e for e in self.edges
+            if e.kind == "REFERENCES" and "each" in e.target
+        ]
+        assert each_edges == [], (
+            f"Spurious 'each' REFERENCES edges: {[e.target for e in each_edges]}"
+        )
+
+    def test_count_index_produces_no_spurious_edge(self):
+        """count.index should not produce any REFERENCES edge."""
+        count_edges = [
+            e for e in self.edges
+            if e.kind == "REFERENCES" and "count" in e.target
+        ]
+        assert count_edges == [], (
+            f"Spurious 'count' REFERENCES edges: {[e.target for e in count_edges]}"
+        )
+
+    def test_path_module_produces_no_edge(self):
+        """path.module must not produce a REFERENCES edge."""
+        path_edges = [
+            e for e in self.edges
+            if e.kind == "REFERENCES" and "path" in e.target
+        ]
+        assert path_edges == [], (
+            f"Spurious 'path' REFERENCES edges: {[e.target for e in path_edges]}"
+        )
+
+    def test_terraform_workspace_produces_no_edge(self):
+        """terraform.workspace must not produce a REFERENCES edge."""
+        tf_edges = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and e.target.rsplit("::", 1)[-1].startswith("terraform")
+        ]
+        assert tf_edges == [], (
+            f"Spurious 'terraform' REFERENCES edges: {[e.target for e in tf_edges]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Resource-to-resource for_each chaining
+    # ------------------------------------------------------------------
+
+    def test_for_each_resource_chaining(self):
+        """for_each = aws_vpc.main emits REFERENCES to resource.aws_vpc.main."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_internet_gateway.gw" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_vpc.main" in t for t in targets), (
+            f"Expected resource.aws_vpc.main in refs from gw; got {targets}"
+        )
+
+    # ------------------------------------------------------------------
+    # Variable references inside template string interpolations
+    # ------------------------------------------------------------------
+
+    def test_template_interpolation_extracts_var_ref(self):
+        """\"${var.region}-static-assets\" must produce a REFERENCES edge to var.region."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_s3_bucket.static" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.region" in t for t in targets), (
+            f"Expected var.region in refs from static bucket; got {targets}"
+        )
+
+    # ------------------------------------------------------------------
+    # Nested block and dynamic block references
+    # ------------------------------------------------------------------
+
+    def test_lifecycle_replace_triggered_by(self):
+        """lifecycle { replace_triggered_by = [...] } must emit REFERENCES edges."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_autoscaling_group.web" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_launch_template.web" in t for t in targets), (
+            f"Expected resource.aws_launch_template.web in refs from asg.web; got {targets}"
+        )
+
+    def test_dynamic_block_for_each_ref(self):
+        """dynamic block: for_each = var.ingress_rules must produce REFERENCES edge."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_security_group.main" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.ingress_rules" in t for t in targets), (
+            f"Expected var.ingress_rules in refs from sg.main; got {targets}"
+        )
+
+    # ------------------------------------------------------------------
+    # Dynamic block iterator scope
+    # ------------------------------------------------------------------
+
+    def test_dynamic_block_iterator_no_spurious_edge(self):
+        """Iterator variables from dynamic blocks must not produce REFERENCES edges.
+
+        Covers: ingress (existing fixture), setting (default iterator),
+        srv (custom iterator=), origin_group and origin (nested dynamic).
+        """
+        iterator_names = ("ingress", "setting", "srv", "origin_group", "origin")
+        spurious = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and any(f"resource.{name}." in e.target for name in iterator_names)
+        ]
+        assert spurious == [], (
+            f"Spurious iterator REFERENCES edges: {[e.target for e in spurious]}"
+        )
+
+    def test_dynamic_block_default_iterator_for_each_extracted(self):
+        """for_each = var.settings inside dynamic block must produce a REFERENCES edge."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_elastic_beanstalk_environment.tfenvtest" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.settings" in t for t in targets), (
+            f"Expected var.settings in refs from tfenvtest; got {targets}"
+        )
+
+    def test_dynamic_block_resource_ref_alongside_iterator(self):
+        """Non-iterator attribute refs must still be extracted from the same block.
+
+        aws_elastic_beanstalk_environment.tfenvtest references both
+        var.settings (via for_each) and aws_elastic_beanstalk_application.tftest
+        (via application = <resource>.name) while also containing a 'setting'
+        iterator.  Both real refs must survive.
+        """
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_elastic_beanstalk_environment.tfenvtest" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("resource.aws_elastic_beanstalk_application.tftest" in t for t in targets), (
+            f"Expected aws_elastic_beanstalk_application.tftest ref; got {targets}"
+        )
+
+    def test_dynamic_block_custom_iterator_for_each_extracted(self):
+        """for_each = var.server_list with iterator = srv must still extract var.server_list."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_lb_listener_rule.hosts" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.server_list" in t for t in targets), (
+            f"Expected var.server_list in refs from aws_lb_listener_rule.hosts; got {targets}"
+        )
+
+    def test_nested_dynamic_outer_for_each_extracted(self):
+        """Outer dynamic for_each = var.load_balancer_origin_groups must be extracted."""
+        refs = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.aws_cloudfront_distribution.cdn" in e.source
+        ]
+        targets = {e.target for e in refs}
+        assert any("var.load_balancer_origin_groups" in t for t in targets), (
+            f"Expected var.load_balancer_origin_groups in refs from cdn; got {targets}"
+        )
+
+    def test_nested_dynamic_inner_iterator_refs_suppressed(self):
+        """Inner dynamic for_each = origin_group.value.origins must produce NO edge.
+
+        origin_group is an iterator variable from the outer dynamic block;
+        treating it as a resource type would emit a spurious
+        resource.origin_group.value edge.
+        """
+        spurious = [
+            e for e in self.edges
+            if e.kind == "REFERENCES"
+            and "resource.origin_group." in e.target
+        ]
+        assert spurious == [], (
+            f"Spurious origin_group REFERENCES edges: {[e.target for e in spurious]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ansible YAML parsing tests
+# ---------------------------------------------------------------------------
+
+try:
+    import yaml as _yaml_check  # noqa: F401
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
+_ANSIBLE_SKIP = pytest.mark.skipif(not _YAML_AVAILABLE, reason="pyyaml not installed")
+
+_PLAYBOOK = FIXTURES / "playbooks" / "sample_ansible_playbook.yml"
+_TASKS_FILE = FIXTURES / "tasks" / "sample_ansible_tasks.yml"
+_META_FILE = FIXTURES / "roles" / "myrole" / "meta" / "main.yml"
+
+
+@_ANSIBLE_SKIP
+class TestAnsiblePlaybookParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(_PLAYBOOK)
+
+    def test_detects_language_ansible_paths(self):
+        p = self.parser
+        assert p.detect_language(Path("playbooks/site.yml")) == "ansible"
+        assert p.detect_language(Path("roles/web/tasks/main.yml")) == "ansible"
+        assert p.detect_language(Path("handlers/main.yml")) == "ansible"
+        assert p.detect_language(Path("config/settings.yml")) == "yaml"
+
+    def test_file_node_created(self):
+        file_nodes = [n for n in self.nodes if n.kind == "File"]
+        assert len(file_nodes) == 1
+        assert file_nodes[0].language == "ansible"
+
+    def test_finds_plays_as_class_nodes(self):
+        play_names = {n.name for n in self.nodes if n.kind == "Class"}
+        assert "Configure web servers" in play_names
+        assert "Configure database servers" in play_names
+
+    def test_plays_have_ansible_kind_extra(self):
+        plays = [n for n in self.nodes if n.kind == "Class"]
+        assert plays, "expected at least one play"
+        for p in plays:
+            assert p.extra.get("ansible_kind") == "play"
+
+    def test_import_playbook_produces_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "base-setup.yml" in targets
+
+    def test_pre_task_extracted(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Verify connectivity" in func_names
+
+    def test_post_task_extracted(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Smoke test" in func_names
+
+    def test_finds_tasks_as_function_nodes(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Install packages" in func_names
+        assert "Deploy config" in func_names
+        assert "Run deploy tasks" in func_names
+
+    def test_fqcn_module_stored_in_extra(self):
+        task = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "Verify connectivity"
+        )
+        assert task.extra.get("ansible_module") == "ansible.builtin.wait_for_connection"
+
+    def test_finds_handlers(self):
+        handlers = [
+            n for n in self.nodes
+            if n.kind == "Function" and n.extra.get("ansible_kind") == "handler"
+        ]
+        handler_names = {h.name for h in handlers}
+        assert "restart app" in handler_names
+        assert "restart db" in handler_names
+
+    def test_handler_listen_stored(self):
+        handler = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "restart app"
+        )
+        assert handler.extra.get("ansible_listen") == "app restarted"
+
+    def test_notify_scalar_produces_calls(self):
+        calls = {e.target for e in self.edges if e.kind == "CALLS"}
+        assert any(target.endswith("::Configure web servers.restart app") for target in calls)
+
+    def test_notify_list_produces_multiple_calls(self):
+        calls = {e.target for e in self.edges if e.kind == "CALLS"}
+        assert any(target.endswith("::Configure database servers.restart db") for target in calls)
+        assert any(target.endswith("::Configure database servers.run migrations") for target in calls)
+
+    def test_include_tasks_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "deploy.yml" in targets
+
+    def test_import_role_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "security" in targets
+
+    def test_roles_list_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "common" in targets
+        assert "nginx" in targets
+
+    def test_vars_files_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "vars/common.yml" in targets
+
+    def test_block_tasks_extracted(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Run migration script" in func_names
+        assert "Verify migration" in func_names
+
+    def test_rescue_tasks_extracted(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Log migration failure" in func_names
+
+    def test_block_tasks_parented_to_play(self):
+        block_task = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "Run migration script"
+        )
+        assert block_task.parent_name == "Configure web servers"
+
+    def test_file_contains_plays(self):
+        file_path_str = str(_PLAYBOOK)
+        file_contains = {e.target for e in self.edges
+                         if e.kind == "CONTAINS" and e.source == file_path_str}
+        assert any("Configure web servers" in t for t in file_contains)
+
+    def test_line_numbers_positive(self):
+        for n in self.nodes:
+            assert n.line_start > 0, f"{n.name} has line_start={n.line_start}"
+            assert n.line_end >= n.line_start, f"{n.name} has bad line range"
+
+    def test_all_nodes_language_ansible(self):
+        for n in self.nodes:
+            assert n.language == "ansible", f"{n.name} has language={n.language!r}"
+
+
+@_ANSIBLE_SKIP
+class TestAnsibleTasksParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(_TASKS_FILE)
+
+    def test_file_language_ansible(self):
+        file_nodes = [n for n in self.nodes if n.kind == "File"]
+        assert file_nodes[0].language == "ansible"
+
+    def test_named_tasks_found(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert "Create app user" in func_names
+        assert "Clone repository" in func_names
+        assert "Install requirements" in func_names
+
+    def test_nameless_task_fallback_name(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        fallbacks = [n for n in func_names if "@line" in n and "package" in n.lower()]
+        assert fallbacks, "expected a fallback-named task for the nameless package task"
+
+    def test_loop_key_not_misidentified_as_module(self):
+        func_names = {n.name for n in self.nodes if n.kind == "Function"}
+        assert not any(n.startswith("loop@") or n.startswith("with_") for n in func_names)
+
+    def test_fqcn_include_role_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "shared_config" in targets
+
+    def test_import_tasks_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "deploy_steps.yml" in targets
+
+    def test_include_vars_imports_from(self):
+        targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
+        assert "env_vars.yml" in targets
+
+    def test_file_contains_tasks(self):
+        file_path_str = str(_TASKS_FILE)
+        sources = {e.source for e in self.edges if e.kind == "CONTAINS"}
+        assert file_path_str in sources
+
+    def test_tasks_have_no_parent_play(self):
+        for n in self.nodes:
+            if n.kind == "Function":
+                assert n.parent_name is None, f"{n.name} should have no parent_play"
+
+
+@_ANSIBLE_SKIP
+class TestAnsibleMetaParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(_META_FILE)
+
+    def test_file_language_ansible(self):
+        file_nodes = [n for n in self.nodes if n.kind == "File"]
+        assert file_nodes[0].language == "ansible"
+
+    def test_depends_on_bare_string(self):
+        dep_targets = {e.target for e in self.edges if e.kind == "DEPENDS_ON"}
+        assert "common" in dep_targets
+
+    def test_depends_on_role_key(self):
+        dep_targets = {e.target for e in self.edges if e.kind == "DEPENDS_ON"}
+        assert "nginx" in dep_targets
+
+    def test_depends_on_name_key_collections(self):
+        dep_targets = {e.target for e in self.edges if e.kind == "DEPENDS_ON"}
+        assert "security.hardening" in dep_targets

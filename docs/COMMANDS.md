@@ -107,7 +107,7 @@ repo_root: str | None
 model: str | None    # Embedding model name
 provider: str | None # local, openai, google, minimax
 ```
-Local embeddings require: `pip install code-review-graph[embeddings]`. Cloud providers use stdlib HTTP clients and require their provider environment variables.
+Local embeddings require: `pip install "code-review-graph[embeddings]"`. Cloud providers use stdlib HTTP clients and require their provider environment variables.
 
 #### `list_graph_stats_tool`
 ```
@@ -312,6 +312,8 @@ code-review-graph update --brief               # Update graph + show risk panel
 code-review-graph update --brief --verify      # ...and cross-check vs tiktoken
 code-review-graph postprocess                  # Re-run flows, communities, FTS
 code-review-graph embed --provider local       # Compute vector embeddings for semantic search
+code-review-graph update --embedding-provider local --embedding-model all-MiniLM-L6-v2
+                                                # Explicitly refresh an existing index (default: off)
 
 # Monitor and inspect
 code-review-graph status                       # Graph statistics
@@ -325,6 +327,7 @@ code-review-graph detect-changes               # Risk-scored change analysis
 code-review-graph detect-changes --base HEAD~3 # Custom base ref
 code-review-graph detect-changes --brief       # Compact panel with token-savings estimate
 code-review-graph detect-changes --brief --verify  # ...and cross-check vs tiktoken
+code-review-graph detect-changes --churn       # Add opt-in change-frequency risk
 
 # detect-changes vs update --brief — which one?
 # • detect-changes --brief: read-only. Asks "what's the impact of my current

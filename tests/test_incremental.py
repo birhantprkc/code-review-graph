@@ -3,6 +3,7 @@
 import subprocess
 from unittest.mock import MagicMock, patch  # noqa: F401 – patch used in tests
 
+import code_review_graph.incremental as incremental_module
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     _is_binary,
@@ -22,6 +23,36 @@ from code_review_graph.incremental import (
     incremental_update,
     start_watch_thread,
 )
+
+
+class TestParseExecutorSelection:
+    def test_stdio_mcp_uses_threads_on_unix(self, monkeypatch):
+        monkeypatch.delenv("CRG_PARSE_EXECUTOR", raising=False)
+        monkeypatch.setattr(
+            incremental_module, "_MCP_STDIO_ACTIVE", True, raising=False,
+        )
+        monkeypatch.setattr(incremental_module.sys, "platform", "linux")
+        monkeypatch.setattr(incremental_module.sys.stdin, "isatty", lambda: False)
+
+        assert incremental_module._select_executor_kind() == "thread"
+
+    def test_non_mcp_unix_automation_keeps_process_default(self, monkeypatch):
+        monkeypatch.delenv("CRG_PARSE_EXECUTOR", raising=False)
+        monkeypatch.setattr(
+            incremental_module, "_MCP_STDIO_ACTIVE", False, raising=False,
+        )
+        monkeypatch.setattr(incremental_module.sys, "platform", "linux")
+        monkeypatch.setattr(incremental_module.sys.stdin, "isatty", lambda: False)
+
+        assert incremental_module._select_executor_kind() == "process"
+
+    def test_explicit_process_override_wins_in_stdio_mcp(self, monkeypatch):
+        monkeypatch.setenv("CRG_PARSE_EXECUTOR", "process")
+        monkeypatch.setattr(
+            incremental_module, "_MCP_STDIO_ACTIVE", True, raising=False,
+        )
+
+        assert incremental_module._select_executor_kind() == "process"
 
 
 class TestFindRepoRoot:
@@ -188,16 +219,17 @@ class TestEnsureRepoGitignoreExcludesCrg:
 class TestIgnorePatterns:
     def test_default_patterns_loaded(self, tmp_path):
         patterns = _load_ignore_patterns(tmp_path)
-        assert "node_modules/**" in patterns
-        assert ".git/**" in patterns
-        assert "__pycache__/**" in patterns
+        assert "**/node_modules/**" in patterns
+        assert "**/.git/**" in patterns
+        assert "**/__pycache__/**" in patterns
+        assert "/build/**" in patterns
 
     def test_custom_ignore_file(self, tmp_path):
         ignore = tmp_path / ".code-review-graphignore"
-        ignore.write_text("custom/**\n# comment\n\nvendor/**\n")
+        ignore.write_text("custom/\n# comment\n\nvendor/**\n")
         patterns = _load_ignore_patterns(tmp_path)
-        assert "custom/**" in patterns
-        assert "vendor/**" in patterns
+        assert "**/custom/**" in patterns
+        assert "**/vendor/**" in patterns
         # Comments and blanks should be skipped
         assert "# comment" not in patterns
         assert "" not in patterns
@@ -208,6 +240,19 @@ class TestIgnorePatterns:
         assert _should_ignore("test.pyc", patterns)
         assert _should_ignore(".git/HEAD", patterns)
         assert not _should_ignore("src/main.py", patterns)
+
+    def test_should_ignore_directory_trailing_slash_pattern(self, tmp_path):
+        ignore = tmp_path / ".code-review-graphignore"
+        ignore.write_text("vendor/\n/generated/\n")
+
+        patterns = _load_ignore_patterns(tmp_path)
+        assert "**/vendor/**" in patterns
+        assert "/generated/**" in patterns
+        assert _should_ignore("vendor/autoload.php", patterns)
+        assert _should_ignore("services/api/vendor/autoload.php", patterns)
+        assert _should_ignore("generated/code.js", patterns)
+        assert not _should_ignore("packages/app/generated/code.js", patterns)
+        assert not _should_ignore("src/vendorized/file.php", patterns)
 
     def test_should_ignore_nested_dependency_dirs(self):
         """Nested node_modules / vendor / .gradle should be ignored (#91)."""
@@ -241,6 +286,36 @@ class TestIgnorePatterns:
         # Coverage/cache
         assert _should_ignore("coverage/lcov.info", patterns)
         assert _should_ignore(".cache/webpack/index.pack", patterns)
+
+    def test_root_output_defaults_do_not_hide_nested_source_directories(self):
+        """Reviewed #92 semantics keep ambiguous output names root-relative."""
+        from code_review_graph.incremental import DEFAULT_IGNORE_PATTERNS
+
+        patterns = DEFAULT_IGNORE_PATTERNS
+        for directory in ("build", "dist", "bin", "obj", "target"):
+            assert _should_ignore(f"{directory}/generated/output.js", patterns)
+            assert not _should_ignore(
+                f"packages/app/{directory}/source.py",
+                patterns,
+            )
+
+    def test_cdk_output_default_matches_at_any_depth(self):
+        """AWS CDK synth output is generated in root and monorepo projects."""
+        from code_review_graph.incremental import DEFAULT_IGNORE_PATTERNS
+
+        patterns = DEFAULT_IGNORE_PATTERNS
+        assert _should_ignore("cdk.out/manifest.json", patterns)
+        assert _should_ignore("packages/infra/cdk.out/asset.js", patterns)
+        assert not _should_ignore("packages/infra/cdk.output/source.ts", patterns)
+
+    def test_safe_dependency_defaults_still_match_at_any_depth(self):
+        """The monorepo dependency case from #91 remains fixed."""
+        from code_review_graph.incremental import DEFAULT_IGNORE_PATTERNS
+
+        patterns = DEFAULT_IGNORE_PATTERNS
+        assert _should_ignore("packages/app/node_modules/pkg/index.js", patterns)
+        assert _should_ignore("services/api/vendor/pkg/file.php", patterns)
+        assert _should_ignore("src/lib/__pycache__/module.pyc", patterns)
 
 
 class TestDataDir:
@@ -385,7 +460,6 @@ class TestDataDirRegistry:
     def test_registry_fallback_to_env_var(self, tmp_path, monkeypatch):
         """Fall back to CRG_DATA_DIR when registry has no entry."""
         from code_review_graph.incremental import get_data_dir
-        from code_review_graph.registry import Registry
 
         repo = tmp_path / "project"
         repo.mkdir()
@@ -401,7 +475,6 @@ class TestDataDirRegistry:
     def test_registry_fallback_to_default(self, tmp_path, monkeypatch):
         """Fall back to default when neither registry nor env var is set."""
         from code_review_graph.incremental import get_data_dir
-        from code_review_graph.registry import Registry
 
         repo = tmp_path / "project"
         repo.mkdir()
@@ -454,25 +527,37 @@ class TestGitOperations:
     def test_get_changed_files(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="src/a.py\nsrc/b.py\n",
+            stdout=b"src/a.py\0src/b.py\0",
         )
         result = get_changed_files(tmp_path)
         assert result == ["src/a.py", "src/b.py"]
         mock_run.assert_called_once()
         call_args = mock_run.call_args
         assert "git" in call_args[0][0]
+        assert "-z" in call_args[0][0]
         assert call_args[1].get("timeout") == 30
+        assert "text" not in call_args[1]
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_changed_files_fallback(self, mock_run, tmp_path):
         # First call fails, second succeeds
         mock_run.side_effect = [
-            MagicMock(returncode=1, stdout=""),
-            MagicMock(returncode=0, stdout="staged.py\n"),
+            MagicMock(returncode=1, stdout=b""),
+            MagicMock(returncode=0, stdout=b"staged.py\0"),
         ]
         result = get_changed_files(tmp_path)
         assert result == ["staged.py"]
         assert mock_run.call_count == 2
+        assert "-z" in mock_run.call_args_list[1].args[0]
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_changed_files_rejects_failed_fallback(self, mock_run, tmp_path):
+        mock_run.side_effect = [
+            MagicMock(returncode=128, stdout=b""),
+            MagicMock(returncode=128, stdout=b"misleading.py\0"),
+        ]
+
+        assert get_changed_files(tmp_path) == []
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_changed_files_timeout(self, mock_run, tmp_path):
@@ -481,17 +566,47 @@ class TestGitOperations:
         assert result == []
 
     @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_changed_files_rejects_option_like_base(self, mock_run, tmp_path):
+        assert get_changed_files(tmp_path, base="--no-index") == []
+        mock_run.assert_not_called()
+
+    @patch("code_review_graph.incremental.subprocess.run")
     def test_get_staged_and_unstaged(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=" M src/a.py\n?? new.py\nR  old.py -> new_name.py\n",
+            stdout=(
+                b" M src/a.py\0"
+                b"?? new.py\0"
+                b"R  new_name.py\0old.py\0"
+                b"C  copied.py\0source.py\0"
+                b" M path -> literal.py\0"
+                b" M  leading and trailing.py \0"
+            ),
         )
         result = get_staged_and_unstaged(tmp_path)
         assert "src/a.py" in result
         assert "new.py" in result
         assert "new_name.py" in result
-        # old.py should NOT be in results (renamed away)
+        assert "copied.py" in result
+        assert "path -> literal.py" in result
+        assert " leading and trailing.py " in result
+        # Rename/copy sources should NOT be in results (destination-only).
         assert "old.py" not in result
+        assert "source.py" not in result
+        command = mock_run.call_args.args[0]
+        assert "--untracked-files=all" in command
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_staged_and_unstaged_rejects_failed_status(
+        self, mock_run, tmp_path
+    ):
+        mock_run.return_value = MagicMock(
+            returncode=128,
+            stdout=b"?? misleading.py\0",
+            stderr=b"fatal: not a git repository",
+        )
+
+        assert get_staged_and_unstaged(tmp_path) == []
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_all_tracked_files(self, mock_run, tmp_path):

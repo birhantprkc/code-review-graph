@@ -2,6 +2,152 @@
 
 ## [Unreleased]
 
+## [2.3.7] - 2026-07-18
+
+**Maintainer-reconciliation release.** This release packages the verified work
+merged since v2.3.6: broader language and framework coverage, safer graph and
+CLI workflows, platform-install hardening, daemon reliability, and the final
+CodeQL security fixes. The four client-validation drafts remain excluded. No
+breaking changes.
+
+### Added
+
+- Expanded CLI-first workflows with CommonJS `require()` parsing, ten focused
+  graph commands, quiet and JSON output, bounded enrichment, and dead-code
+  analysis (PRs #95, #340, and #341).
+- Added safe Java and Spring modeling for request endpoints, WebFlux routes,
+  value-redacted application configuration, scheduled triggers, application
+  events, Lombok constructor injection, runtime callbacks, and method
+  references (PRs #462, #577, #589, #590, and #591).
+- Added repository-bounded PHP/Laravel semantics and Julia qualified-scope
+  parsing, plus evidence-backed typed-member resolution, Python star-import
+  expansion, Python class decorators, and C# inheritance edges (PRs #628,
+  #638, #639, #643, #647, and #649).
+- Added bounded transitive test coverage, opt-in churn risk, weighted
+  impact-radius ranking, and graph provenance on MCP responses (PRs #636,
+  #640, #644, and #646).
+- Added CodeBuddy Code MCP configuration and project skills using its official
+  shared project contract (PR #633).
+- Added Terraform/OpenTofu structural parsing for resources, data sources,
+  modules, variables, outputs, locals, providers, and expression references.
+  References resolve across sibling files in a Terraform module, and local
+  module sources connect to parsed target files (PR #514; Terraform portion of
+  #199).
+- Added Ansible playbook, role, task, handler, notification, include, and role
+  dependency extraction with qualified graph relationships, duplicate-task
+  disambiguation, and ordinary-YAML false-positive guards (PR #415).
+- Added bounded VB.NET structural parsing for namespaces, types, generics,
+  multiline members, properties, calls, inheritance, and interfaces. Same-file
+  targets resolve case-insensitively only when scope evidence is unique, and
+  overloads share one stable graph symbol (replacing PR #517).
+- Expanded SystemVerilog structure with ports, nets, parameters, packages,
+  typedefs, modports, port references, and verification declarations. Function
+  locals are excluded rather than promoted to module globals, and signal nodes
+  no longer pollute function risk, flow, dead-code, or size analyses (PR #522).
+- Corrected Rust trait and `impl` identity, preserving one concrete type across
+  repeated implementation blocks. Nested/aliased `use` trees, `Self` and
+  turbofish calls, and bounded cached Cargo path/workspace dependency resolution
+  now retain their original graph targets (replacing PR #526).
+- Added an explicit local JSON visualization export. The output is written
+  atomically inside the ignored graph data directory and is documented as
+  potentially containing absolute paths and code-structure metadata (PR #449).
+- Functions and classes now retain a bounded, first-paragraph documentation
+  summary in backward-compatible node metadata across Python, JSDoc/Javadoc,
+  C# XML docs, Doxygen, Rust, and Go. Semantic embedding text includes the
+  normalized summary, so behavior-oriented queries no longer depend only on
+  identifier overlap (replacing PR #602, with Stefan Hudici attribution).
+- Explicit provider-and-model-scoped embedding refresh is available on build,
+  update, postprocess, and watch paths. It is default-off, refuses silent
+  provider/model/endpoint migration, remains fail-soft, and purges vectors for
+  deleted or renamed nodes; manual `embed` also purges orphans (replacing PR
+  #599, with Stefan Hudici attribution).
+- Added `code-review-graph uninstall` as a safe, symmetric counterpart to
+  `install` (#482, replacing PR #491). It derives MCP cleanup from the live
+  platform specifications, preserves unrelated shared configuration and JSONC
+  comments, commits shared-file edits with atomic replacement, removes only
+  CRG-owned hook/skill files, requires and normalizes Git/SVN repository roots,
+  enforces repository/home boundaries, and supports dry-run,
+  registered-repository, data-retention, and user-config-retention modes.
+
+### Fixed
+
+- Made minimal-context and review analysis non-blocking, shared changed-file
+  discovery across review tools, bounded automatic repository detection, and
+  cached graph access so MCP requests avoid repeated scans (PRs #394 and #457).
+- Corrected semantic-search mode reporting, skipped unavailable native grammar
+  parsers safely, and surfaced graph staleness, omitted counts, and symbol
+  disambiguation in responses (PRs #458, #459, and #538).
+- Hardened daemon startup and persistence: foreground lifecycle state is ready
+  before serving, generated TOML escapes strings, and Windows PID checks use
+  waitable handles without leaking temporary handles (PRs #630 and #632).
+- Preserved undecodable subprocess output, expanded trailing-slash ignores,
+  retained nested source directories, and excluded AWS CDK synth output without
+  hiding source trees (PRs #566, #583, and #635).
+- Reconciled community detection placement/splitting and restored responsive
+  visualization sizing without changing graph data (PRs #641 and #642).
+- Serialized first-use local embedding dependency imports and model construction
+  across MCP worker threads. POSIX startup remains lazy, failed loads are not
+  cached, and Windows retains its main-thread prewarm (#610, replacing PR #611).
+- PHP scoped/static calls now resolve during parsing when backed by same-file,
+  enclosing-class, import, qualified-name, or namespace evidence. This keeps
+  incremental work bounded to changed files and leaves unrelated globally
+  unique `Class::method` names unresolved (safe subset of PR #568).
+- Incremental Git change discovery now reads NUL-delimited byte output, so
+  Unicode, whitespace, newline, and literal arrow paths are preserved while
+  rename/copy records keep destination-only semantics (PR #618).
+- MCP stdio servers now use thread-based parallel parsing on every platform,
+  preventing inherited transport descriptors from keeping Unix servers and
+  workers alive after host disconnects, while normal non-interactive CLI/CI
+  builds retain the faster process-pool default (PR #615).
+- Bare CALLS targets and TESTED_BY sources are qualified during postprocessing
+  only when same-file or import evidence identifies exactly one node. Query-time
+  fallbacks apply the same rule, preventing unrelated same-named functions from
+  inheriting tests (replacing the unsound subset of PR #601).
+- Corrected TESTED_BY edge direction across graph, refactor, and transitive-test
+  consumers, with a parser-to-store-to-query regression (#527/#559/#598 class).
+- C# receiver calls now capture bare, chained, member, and null-conditional
+  invocations with caller attribution (#612); Kotlin/C# annotations and C#
+  namespace importer resolution—including nested namespaces—are also preserved
+  (#295/#310, PR #353).
+- Restored advertised Zig structure, calls, imports, and test nodes, including
+  TESTED_BY edges for test blocks embedded in ordinary source files (PR #393).
+- Hardened generated skills/configuration: uppercase `SKILL.md` (PR #563),
+  string-safe JSONC plus top-level and nested-container data-preservation guards
+  (#553, PR #354), and portable PATH-aware hooks (PR #565).
+- Packaged documentation remains reachable through the MCP wrapper (#613),
+  Action comments render repository-relative paths, and both visualization
+  templates select the graph SVG specifically (PR #564).
+- **PHP `use` imports now resolve to files** (`importers_of`, impact radius,
+  call disambiguation): PHP `use` statements had no branch in the parser's
+  import extraction and fell through to the raw-text fallback, storing the whole
+  `use ...;` statement as the `IMPORTS_FROM` edge target (e.g.
+  `"use App\Domain\Entity\Job;"`). As a result `importers_of` / `tests_for` /
+  `inheritors_of` and the upstream side of `get_impact_radius` returned nothing
+  for PHP classes, and the unresolved targets also degraded cross-file `CALLS`
+  disambiguation in `resolve_bare_call_targets`. PHP imports are now recorded as
+  fully-qualified names (handling `as` aliases, grouped `use A\{B, C}`, and
+  `use function` / `use const`) and resolved to absolute `.php` paths by walking
+  up from the importing file, mirroring the existing Java resolver. Vendor/global
+  classes with no local file stay as the bare FQN.
+
+### Changed
+
+- Updated supported async, embedding, watchdog, checkout, cache, and Python
+  setup dependencies while keeping the published compatibility bounds explicit
+  (PRs #544, #629, and #631).
+- Fork pull-request reviews now use a least-privilege two-stage workflow, and
+  evaluation configs use larger pinned commits for reproducible measurements
+  (PRs #468 and #634).
+- Build output now exposes post-processing stage timings for performance
+  diagnosis (PR #637).
+
+### Security
+
+- Closed all three open high-severity CodeQL alerts: the PyPI diagnostic now
+  uses the default secure TLS context, URL checks compare parsed hostnames, and
+  visualization tests use structural HTML parsing instead of unsafe regular
+  expressions (PR #657).
+
 ## [2.3.6] - 2026-06-10
 
 **Community-response release.** Built from a full audit of every open PR,
